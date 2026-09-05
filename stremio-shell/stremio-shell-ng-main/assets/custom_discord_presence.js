@@ -4,20 +4,29 @@
   if (window.__stremioCustomDiscordPresence) return;
   window.__stremioCustomDiscordPresence = true;
 
+  /**
+   * Discord Rich Presence bridge (MyStremio).
+   *
+   * Ported to match Loukious/stremio-shell-ng behaviour: the shell now owns
+   * presence rendering (poster art, episode names, buttons, timestamps), so
+   * this script's only job is to report *where the user is* and mirror the
+   * Settings toggles. No more DOM scraping of titles or clock labels, and no
+   * more 3s payload churn -- we push on navigation and on setting changes.
+   */
+
   const ENABLED_KEY = 'stremio-custom-discord-rp-enabled';
   const SHOW_PAUSED_KEY = 'stremio-custom-discord-rp-show-paused';
   const SHOW_MENU_KEY = 'stremio-custom-discord-rp-show-menu';
-  let lastPayload = '';
-  let pollTimer = null;
-  let lastRoute = '';
 
-  function isEnabled() {
-    try {
-      return localStorage.getItem(ENABLED_KEY) === 'true';
-    } catch {
-      return false;
-    }
-  }
+  // Safety-net resync. The shell refreshes the activity on its own cadence
+  // (RPCconfig.ini -> [Activity] refresh_interval), so this only has to cover
+  // route changes that slipped past the listeners below.
+  const HEARTBEAT_MS = 15000;
+
+  let lastPayload = '';
+  let heartbeatTimer = null;
+  let lastRoute = '';
+  let cleared = true;
 
   function readBool(key, fallback) {
     try {
@@ -29,181 +38,105 @@
     }
   }
 
+  function isEnabled() {
+    return readBool(ENABLED_KEY, false);
+  }
+
   /**
-   * Current app hash route without query/hash fragments.
+   * Current app hash route, query string preserved off.
+   * The shell matches on `/player/` and `/detail/` substrings.
    * @returns {string}
    */
   function getRoute() {
     const raw = (location.hash || '#/').replace(/^#/, '') || '/';
-    return raw.split('?')[0].split('#')[0] || '/';
+    return raw.split('?')[0] || '/';
   }
 
   function isPlayerRoute() {
     return /^\/player/.test(getRoute());
   }
 
-  function readPlayerTitleFromDom() {
-    const selectors = [
-      '[class*="title-bar-container"] [class*="title"]',
-      '[class*="player-container"] [class*="title"]',
-      '[class*="control-bar"] [class*="title"]',
-      '[class*="nav-bar-container"] h2',
-    ];
-    for (const selector of selectors) {
-      const text = document.querySelector(selector)?.textContent?.trim();
-      if (text) return text;
-    }
-    return '';
-  }
-
-  async function readPlayerFromCore() {
-    if (!window.core?.getState) return null;
-    try {
-      const player = await window.core.getState('player');
-      if (!player) return null;
-
-      const meta = player.meta || player.selected?.meta || player.item?.meta;
-      const title = meta?.name || meta?.title || '';
-      if (!title) return null;
-
-      let subtitle = '';
-      const type = meta?.type;
-      const season = player.seriesInfo?.season ?? player.season ?? meta?.season;
-      const episode = player.seriesInfo?.episode ?? player.episode ?? meta?.episode;
-      const episodeTitle =
-        player.seriesInfo?.episodeTitle ||
-        player.episodeTitle ||
-        meta?.episodeTitle ||
-        '';
-
-      if (type === 'series' && (season != null || episode != null)) {
-        subtitle = `S${season || '?'}E${episode || '?'}`;
-        if (episodeTitle) subtitle += ` - ${episodeTitle}`;
-      } else if (meta?.year) {
-        subtitle = String(meta.year);
-      }
-
-      return { title, subtitle, type };
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function readCurrentTime() {
-    const labels = document.querySelectorAll('[class*="seek-bar-container"] [class*="label"]');
-    for (const label of labels) {
-      const text = (label.textContent || '').trim();
-      if (/^\d/.test(text) && !text.startsWith('-')) {
-        return text;
-      }
-    }
-    return '';
-  }
-
-  function readDuration() {
-    const labels = Array.from(
-      document.querySelectorAll('[class*="seek-bar-container"] [class*="label"]')
-    );
-    const times = labels
-      .map((label) => (label.textContent || '').trim())
-      .filter((text) => /^\d/.test(text));
-    if (times.length >= 2) return times[times.length - 1];
-    return '';
-  }
-
-  function isPaused() {
+  /**
+   * Best-effort playback state, used only as a fallback before mpv has
+   * reported `pause` natively.
+   * @returns {boolean}
+   */
+  function isPausedFallback() {
     const controlBar =
       document.querySelector('[class*="control-bar"]') ||
       document.querySelector('[class*="player-container"]');
     if (!controlBar) return false;
 
     const playBtn = controlBar.querySelector(
-      '[class*="button-container"][title*="Play"], [class*="button-container"][title*="play"], [class*="button-container"][aria-label*="Play"], [class*="button-container"][aria-label*="play"]'
+      '[class*="button-container"][title*="Play"], [class*="button-container"][aria-label*="Play"]'
     );
     if (playBtn) return true;
 
     const pauseBtn = controlBar.querySelector(
-      '[class*="button-container"][title*="Pause"], [class*="button-container"][title*="pause"], [class*="button-container"][aria-label*="Pause"], [class*="button-container"][aria-label*="pause"]'
+      '[class*="button-container"][title*="Pause"], [class*="button-container"][aria-label*="Pause"]'
     );
     return !pauseBtn;
   }
 
   /**
-   * Friendly Discord label for the current hash route.
-   * Strips query strings so values like `/library?sort=lastwatched` or
-   * `/?streamingServerUrl=...` never leak into Rich Presence.
-   * @param {string} route
-   * @returns {string}
+   * Convert a `h:mm:ss` / `mm:ss` seek-bar label to seconds.
+   * @param {string} raw
+   * @returns {number}
    */
-  function routeLabel(route) {
-    const path = String(route || '/')
-      .split('?')[0]
-      .split('#')[0]
-      .trim() || '/';
-    if (path === '/' || path === '' || path.startsWith('/board')) return 'Board';
-
-    const segment = path.split('/').filter(Boolean)[0] || '';
-    if (!segment || segment.includes('=') || segment.startsWith('streaming')) {
-      return 'Board';
-    }
-
-    const known = {
-      library: 'Library',
-      discover: 'Discover',
-      settings: 'Settings',
-      addons: 'Addons',
-      search: 'Search',
-      calendar: 'Calendar',
-      player: 'Player',
-      intro: 'Login',
-    };
-    const key = segment.toLowerCase();
-    if (known[key]) return known[key];
-    return key.charAt(0).toUpperCase() + key.slice(1);
+  function clockToSeconds(raw) {
+    const parts = String(raw || '')
+      .trim()
+      .split(':')
+      .map((part) => Number.parseInt(part, 10));
+    if (parts.some((n) => Number.isNaN(n))) return 0;
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    if (parts.length === 1) return parts[0];
+    return 0;
   }
 
-  async function buildPayload() {
-    const route = getRoute();
-    const showMenu = readBool(SHOW_MENU_KEY, true);
-    const showPaused = readBool(SHOW_PAUSED_KEY, true);
+  function readSeekLabels() {
+    const labels = Array.from(
+      document.querySelectorAll('[class*="seek-bar-container"] [class*="label"]')
+    )
+      .map((label) => (label.textContent || '').trim())
+      .filter((text) => /^\d/.test(text));
+    return {
+      current: clockToSeconds(labels[0] || ''),
+      duration: clockToSeconds(labels[labels.length - 1] || ''),
+    };
+  }
+
+  function buildPayload() {
+    const payload = {
+      route: getRoute(),
+      showPaused: readBool(SHOW_PAUSED_KEY, true),
+      showMenu: readBool(SHOW_MENU_KEY, true),
+    };
 
     if (isPlayerRoute()) {
-      const core = await readPlayerFromCore();
-      const title = core?.title || readPlayerTitleFromDom() || 'Watching';
-      const subtitle = core?.subtitle || '';
-      const currentTime = readCurrentTime();
-      const duration = readDuration();
-      const paused = isPaused();
-
-      return {
-        state: 'player',
-        title,
-        subtitle,
-        currentTime,
-        duration,
-        paused: paused && showPaused,
-        route,
-      };
+      const { current, duration } = readSeekLabels();
+      payload.paused = isPausedFallback();
+      if (current > 0) payload.currentTimeSeconds = current;
+      if (duration > 0) payload.durationSeconds = duration;
     }
 
-    if (!showMenu) {
-      return { state: 'idle', route };
-    }
-
-    const label = routeLabel(route);
-    return {
-      state: 'menu',
-      title: `Browsing ${label}`,
-      subtitle: 'MyStremio',
-      route,
-    };
+    return payload;
   }
 
   async function sendPresence(payload) {
     if (!window.StremioCustomAPI?.invoke) return;
-    const serialized = JSON.stringify(payload);
-    if (serialized === lastPayload) return;
-    lastPayload = serialized;
+    // Drop the volatile clock fields when deciding whether anything changed,
+    // otherwise we would spam the shell once per second.
+    const identity = JSON.stringify({
+      route: payload.route,
+      showPaused: payload.showPaused,
+      showMenu: payload.showMenu,
+      paused: payload.paused,
+    });
+    if (identity === lastPayload && !cleared) return;
+    lastPayload = identity;
+    cleared = false;
     try {
       await window.StremioCustomAPI.invoke('update-discord-presence', payload);
     } catch (error) {
@@ -214,6 +147,8 @@
 
   async function clearPresence() {
     lastPayload = '';
+    if (cleared) return;
+    cleared = true;
     if (!window.StremioCustomAPI?.invoke) return;
     try {
       await window.StremioCustomAPI.invoke('clear-discord-presence', {});
@@ -222,22 +157,22 @@
 
   async function tick() {
     if (!isEnabled()) {
-      if (lastPayload) await clearPresence();
+      await clearPresence();
       return;
     }
-    await sendPresence(await buildPayload());
+    await sendPresence(buildPayload());
   }
 
   function startPolling() {
-    if (pollTimer) return;
-    pollTimer = window.setInterval(tick, 3000);
+    if (heartbeatTimer) return;
+    heartbeatTimer = window.setInterval(tick, HEARTBEAT_MS);
     tick();
   }
 
   function stopPolling() {
-    if (!pollTimer) return;
-    window.clearInterval(pollTimer);
-    pollTimer = null;
+    if (!heartbeatTimer) return;
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 
   function onRouteChange() {
@@ -253,6 +188,15 @@
     lastPayload = '';
     tick();
   });
+
+  // Reflect play/pause promptly; the shell also gets this natively from mpv.
+  document.addEventListener('click', () => {
+    if (isEnabled() && isPlayerRoute()) window.setTimeout(tick, 150);
+  }, true);
+  document.addEventListener('keyup', (event) => {
+    if (event.key === ' ' && isEnabled() && isPlayerRoute()) window.setTimeout(tick, 150);
+  }, true);
+
   window.addEventListener('storage', (event) => {
     if (
       event.key === ENABLED_KEY ||
@@ -260,6 +204,7 @@
       event.key === SHOW_MENU_KEY
     ) {
       lastPayload = '';
+      if (isEnabled()) startPolling();
       tick();
     }
   });
@@ -290,5 +235,5 @@
     });
   }
 
-  console.info('[StremioCustom] Discord presence bridge ready.');
+  console.info('[StremioCustom] Discord presence bridge ready (native renderer).');
 })();

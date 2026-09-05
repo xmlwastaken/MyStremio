@@ -45,8 +45,7 @@ impl LastSubtitleStyles {
     }
 }
 
-static LAST_SUBTITLE_STYLES: Mutex<LastSubtitleStyles> =
-    Mutex::new(LastSubtitleStyles::new());
+static LAST_SUBTITLE_STYLES: Mutex<LastSubtitleStyles> = Mutex::new(LastSubtitleStyles::new());
 
 struct ObserveProperty {
     name: String,
@@ -276,6 +275,9 @@ fn create_event_thread(
             ("time-pos", Format::Double),
             ("duration", Format::Double),
             ("demuxer-cache-time", Format::Double),
+            // Observed so Discord Rich Presence can mirror play/pause natively
+            // instead of scraping the control bar.
+            ("pause", Format::Flag),
         ] {
             event_context
                 .observe_property(name, format, 0)
@@ -304,17 +306,24 @@ fn create_event_thread(
 
             // even if you don't do anything with the events, it is still necessary to empty the event loop
             let player_response = match event {
-                Event::PropertyChange { name, change, .. } => PlayerResponse(
-                    "mpv-prop-change",
-                    PlayerEvent::PropChange(PlayerProprChange::from_name_value(
-                        name.to_string(),
-                        change,
-                    )),
-                ),
-                Event::EndFile(reason) => PlayerResponse(
-                    "mpv-event-ended",
-                    PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
-                ),
+                Event::PropertyChange { name, change, .. } => {
+                    // Feed Discord Rich Presence with exact playback state.
+                    crate::stremio_app::discord_presence::note_mpv_property(name, &change);
+                    PlayerResponse(
+                        "mpv-prop-change",
+                        PlayerEvent::PropChange(PlayerProprChange::from_name_value(
+                            name.to_string(),
+                            change,
+                        )),
+                    )
+                }
+                Event::EndFile(reason) => {
+                    crate::stremio_app::discord_presence::note_playback_stopped();
+                    PlayerResponse(
+                        "mpv-event-ended",
+                        PlayerEvent::End(PlayerEnded::from_end_reason(reason)),
+                    )
+                }
                 Event::Shutdown => {
                     break;
                 }
