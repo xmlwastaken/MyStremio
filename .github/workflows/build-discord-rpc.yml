@@ -1,0 +1,144 @@
+name: Build MyStremio (Discord Rich Presence)
+
+# Produces `mystremio-shell.exe` with the ported Discord Rich Presence.
+#
+# The exe is a DROP-IN replacement: copy it over the one in your existing
+# MyStremio install folder (default: C:\Program Files\MyStremio\). Nothing else
+# -- webui, server, ffmpeg, your settings -- is touched.
+#
+# Triggers: pushing to main / discord-rpc-ng, or the "Run workflow" button
+# under the Actions tab.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, discord-rpc-ng]
+    paths:
+      - "stremio-shell/stremio-shell-ng-main/**"
+      - ".github/workflows/build-discord-rpc.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The job that matters. Deliberately has NO `needs:` so that a pre-existing
+  # lint/format issue elsewhere in the repo can never stop you getting the exe.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build mystremio-shell.exe
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: stremio-shell/stremio-shell-ng-main
+    steps:
+      - name: Disable git eol translation
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          cache-workspaces: stremio-shell/stremio-shell-ng-main
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Fetch libmpv
+        shell: pwsh
+        run: |
+          # build.rs refuses to link without libmpv-2.dll in the project root.
+          $rss = Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
+          # Prefer the baseline x86_64 build over the "-v3" (AVX2) variant so the
+          # binary still runs on older CPUs.
+          $url = ([regex]::Matches($rss.Content, '<link>(?<u>[^<]*mpv-dev-x86_64-\d[^<]*\.7z)/download</link>') |
+                  Select-Object -First 1).Groups['u'].Value
+          if (-not $url) { throw "Could not resolve a libmpv download URL" }
+          Write-Host "Downloading $url"
+          curl.exe --fail --location --silent --show-error --output mpv-dev.7z $url
+          7z e mpv-dev.7z -o. libmpv-2.dll -y | Out-Null
+          if (-not (Test-Path libmpv-2.dll)) { throw "libmpv-2.dll not found in archive" }
+          Get-Item libmpv-2.dll | Format-List Name, Length
+
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\mystremio-shell.exe" dist
+          # Bundled in case your install predates this libmpv build.
+          Copy-Item "libmpv-2.dll" dist
+          Copy-Item "RPCconfig.example.ini" dist -ErrorAction SilentlyContinue
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mystremio-shell-discord-rpc
+          path: stremio-shell/stremio-shell-ng-main/dist/**
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Advisory only. MyStremio's existing source is not rustfmt-clean (14 of 31
+  # files), so a repo-wide gate would be permanently red through no fault of
+  # this port. Format checking is therefore scoped to the files this port owns,
+  # and clippy/tests are reported without ever failing the run.
+  # ---------------------------------------------------------------------------
+  quality:
+    name: Checks (advisory)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: stremio-shell/stremio-shell-ng-main
+    steps:
+      - name: Disable git eol translation
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+          cache-workspaces: stremio-shell/stremio-shell-ng-main
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Fetch libmpv
+        shell: pwsh
+        run: |
+          $rss = Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
+          $url = ([regex]::Matches($rss.Content, '<link>(?<u>[^<]*mpv-dev-x86_64-\d[^<]*\.7z)/download</link>') |
+                  Select-Object -First 1).Groups['u'].Value
+          curl.exe --fail --location --silent --show-error --output mpv-dev.7z $url
+          7z e mpv-dev.7z -o. libmpv-2.dll -y | Out-Null
+
+      - name: Format check (ported files only)
+        run: |
+          rustfmt --edition 2018 --check src/stremio_app/discord_presence.rs
+          rustfmt --edition 2018 --check src/stremio_app/stremio_player/player.rs
+
+      - name: Unit tests
+        continue-on-error: true
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Clippy (informational)
+        continue-on-error: true
+        run: cargo clippy --all --target x86_64-pc-windows-msvc
