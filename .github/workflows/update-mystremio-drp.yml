@@ -1,0 +1,237 @@
+name: Update MyStremio from upstream and build
+
+# One-button updater for the Discord Rich Presence port.
+#
+# Works out your Discord RPC changes automatically (everything under
+# stremio-shell/ that isn't in upstream xAlphiiJr/MyStremio), applies them on
+# top of the LATEST upstream main, and builds a fresh mystremio-shell.exe.
+# Nothing to paste, nothing to re-port by hand.
+#
+# Your fork is never rewritten - the rebase happens on a throwaway branch
+# inside the runner.
+#
+# If upstream edits the same code we do, the patch stops applying and this
+# fails with a clear message instead of shipping a silently broken exe.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Also publish the exe as a downloadable release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Rebase Discord RPC onto latest upstream, then build
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out your fork (full history)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Apply your Discord RPC changes to the latest upstream code
+        shell: bash
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "github-actions"
+
+          git remote add upstream https://github.com/xAlphiiJr/MyStremio.git
+          git fetch --no-tags upstream main
+
+          branch="${{ github.ref_name }}"
+          base="$(git merge-base "origin/${branch}" upstream/main)"
+
+          echo "your branch      : ${branch} ($(git rev-parse --short origin/${branch}))"
+          echo "shared ancestor  : $(git rev-parse --short ${base})"
+          echo "upstream main now: $(git rev-parse --short upstream/main)"
+
+          # Your changes = everything under stremio-shell/ added on top of the
+          # shared ancestor. Restricted to that path so CI files and docs are
+          # not dragged in.
+          git diff "${base}" "origin/${branch}" -- stremio-shell > "${RUNNER_TEMP}/drp.patch"
+          lines="$(wc -l < "${RUNNER_TEMP}/drp.patch")"
+          echo "your changes     : ${lines} diff lines"
+          if [[ "${lines}" -eq 0 ]]; then
+            echo "::error::No changes found under stremio-shell/. Nothing to apply." >&2
+            exit 1
+          fi
+
+          git checkout -B drp-build upstream/main
+
+          if git apply --3way --whitespace=nowarn "${RUNNER_TEMP}/drp.patch"; then
+            echo "Discord RPC changes applied cleanly to the latest upstream."
+          else
+            echo "::error::Your Discord RPC changes no longer apply to upstream main - upstream has edited the same code. Send this log to get it re-based." >&2
+            git status --short
+            exit 1
+          fi
+
+          echo "--- files changed on top of upstream ---"
+          git status --short
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          v="$(grep -m1 -E '^version[[:space:]]*=' stremio-shell/stremio-shell-ng-main/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          [[ -z "$v" ]] && v="$(date +%Y%m%d)"
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+          echo "Building MyStremio ${v}"
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          # This action defaults RUSTFLAGS to "-D warnings", which turns any
+          # warning anywhere in the crate into a hard failure. Clear it.
+          rustflags: ""
+          cache-workspaces: stremio-shell/stremio-shell-ng-main
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Fetch libmpv
+        shell: pwsh
+        working-directory: stremio-shell/stremio-shell-ng-main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # build.rs refuses to link without libmpv-2.dll in the crate root.
+          # Primary source is the shinchiro mirror on GitHub Releases: same builds
+          # SourceForge hosts, but GitHub->GitHub avoids the throttling SourceForge
+          # applies to CI datacenter IPs.
+          $ErrorActionPreference = "Continue"
+          $dll = "libmpv-2.dll"
+          $archive = "mpv-dev.7z"
+
+          function Try-Download($url) {
+            Write-Host "  GET $url"
+            if (Test-Path $archive) { Remove-Item $archive -Force }
+            curl.exe --fail --location --silent --show-error --retry 3 --retry-delay 5 `
+                     --output $archive $url
+            if (-not (Test-Path $archive)) { Write-Host "  no file produced"; return $false }
+            $size = (Get-Item $archive).Length
+            Write-Host "  downloaded $size bytes"
+            if ($size -lt 1000000) {
+              Write-Host "  too small to be the archive"
+              return $false
+            }
+            & 7z e $archive "-o." $dll -y | Out-Null
+            if (-not (Test-Path $dll)) { Write-Host "  $dll not present in archive"; return $false }
+            return $true
+          }
+
+          $ok = $false
+
+          Write-Host "Source 1: GitHub Releases (shinchiro/mpv-winbuild-cmake)"
+          try {
+            $headers = @{
+              "Accept"        = "application/vnd.github+json"
+              "Authorization" = "Bearer $env:GH_TOKEN"
+              "User-Agent"    = "mystremio-ci"
+            }
+            $releases = Invoke-RestMethod -Headers $headers -Uri `
+              "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=10"
+            # '-\d' skips the "-v3-" (AVX2) variant so the build still runs on older CPUs.
+            $asset = $releases.assets |
+                     Where-Object { $_.name -match '^mpv-dev-x86_64-\d' } |
+                     Select-Object -First 1
+            if ($asset) {
+              Write-Host "  found $($asset.name)"
+              $ok = Try-Download $asset.browser_download_url
+            } else {
+              Write-Host "  no matching asset in the latest 10 releases"
+            }
+          } catch {
+            Write-Host "  failed: $($_.Exception.Message)"
+          }
+
+          if (-not $ok) {
+            Write-Host "Source 2: SourceForge"
+            try {
+              $rss = Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri `
+                "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv"
+              $m = [regex]::Matches($rss.Content,
+                    '<link>(?<u>[^<]*mpv-dev-x86_64-\d[^<]*\.7z/download)</link>') |
+                   Select-Object -First 1
+              if ($m) { $ok = Try-Download $m.Groups['u'].Value }
+              else { Write-Host "  no download link found in RSS feed" }
+            } catch {
+              Write-Host "  failed: $($_.Exception.Message)"
+            }
+          }
+
+          if (-not $ok) { throw "Could not obtain libmpv-2.dll from any source" }
+
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $dll))
+          $sig = [System.Text.Encoding]::ASCII.GetString($bytes[0..1])
+          Write-Host "libmpv-2.dll: $($bytes.Length) bytes, signature '$sig'"
+          if ($sig -ne "MZ") { throw "libmpv-2.dll is not a valid Windows DLL" }
+          Write-Host "libmpv ready."
+
+      - name: Build release
+        working-directory: stremio-shell/stremio-shell-ng-main
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage artifact
+        id: stage
+        shell: pwsh
+        working-directory: stremio-shell/stremio-shell-ng-main
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\mystremio-shell.exe" dist
+          # Bundled in case your install's copy predates this libmpv build.
+          Copy-Item "libmpv-2.dll" dist
+          Copy-Item "RPCconfig.example.ini" dist -ErrorAction SilentlyContinue
+          Get-ChildItem dist | Format-Table Name, Length
+
+          $exe = Get-Item "dist\mystremio-shell.exe"
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "sha=$hash" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "### MyStremio + Discord RPC`n`n- **exe:** $($exe.Name)`n- **Size:** $([math]::Round($exe.Length/1MB,1)) MB`n- **SHA256:** ``$hash``" |
+            Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mystremio-shell-discord-rpc
+          path: stremio-shell/stremio-shell-ng-main/dist/**
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="mystremio-drp-${{ steps.version.outputs.version }}-${{ steps.version.outputs.upstream }}"
+          cd stremio-shell/stremio-shell-ng-main/dist
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" ./* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$tag" ./* \
+              --repo "${{ github.repository }}" \
+              --title "MyStremio ${{ steps.version.outputs.version }} + Discord Rich Presence" \
+              --notes "Unofficial build: upstream MyStremio (\`${{ steps.version.outputs.upstream }}\`) with the Discord Rich Presence port applied.
+
+          **mystremio-shell.exe SHA256:** \`${{ steps.stage.outputs.sha }}\`
+
+          ### Install
+          Drop-in replacement. Quit MyStremio from the tray, rename the existing
+          \`mystremio-shell.exe\` in your install folder to \`.backup\`, then copy this one in.
+          Nothing else (webui, server, ffmpeg, settings) is touched. To roll back, restore the backup.
+
+          Unsigned - SmartScreen will warn, choose More info then Run anyway."
+          fi
+          echo "https://github.com/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
